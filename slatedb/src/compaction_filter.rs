@@ -92,6 +92,16 @@ pub struct CompactionJobContext {
     /// active snapshots. Dropping or modifying such entries may cause snapshot
     /// reads to return inconsistent results.
     pub retention_min_seq: Option<u64>,
+    /// Whether this job attempt resumes from previously written output SSTs.
+    ///
+    /// When `true`, the iterator starts after the last key already written to
+    /// `output_ssts`. A **new** filter instance is still created (filters do
+    /// not persist phase across attempts), so stateful filters that require a
+    /// start-of-stream marker should return
+    /// [`CompactionFilterError::CreationError`]. The compaction worker then
+    /// clears the resume cursor and reschedules the job from key zero rather
+    /// than retrying the same cursor.
+    pub is_resume: bool,
 }
 
 /// Decision returned by a compaction filter for each entry.
@@ -200,9 +210,14 @@ pub trait CompactionFilterSupplier: Send + Sync {
     ///
     /// This method is called each time a compaction job starts or resumes. If a compaction
     /// is interrupted (e.g., compactor restarts) and later resumed, this method will be
-    /// called again with a new filter instance. The new filter will only observe entries
-    /// that have not yet been written to output SSTs. Entries already compacted in
-    /// previous attempts will be skipped.
+    /// called again with a new filter instance. [`CompactionJobContext::is_resume`] is
+    /// `true` when already-written output SSTs will be skipped. The new filter will
+    /// only observe entries that have not yet been written to output SSTs.
+    ///
+    /// Stateful filters that cannot correctly start mid-keyspace should return
+    /// [`CompactionFilterError::CreationError`] when `is_resume` is set. That
+    /// error class reschedules the job from key zero; retrying the same cursor
+    /// would never see the skipped prefix.
     ///
     /// This is async to allow I/O during initialization (loading config,
     /// connecting to external services, etc.) before the filter processes entries.
