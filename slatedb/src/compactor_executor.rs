@@ -566,6 +566,8 @@ impl TokioCompactionExecutorInner {
     /// resuming reuses its persisted [`CompactionContext`] verbatim (see
     /// [`Self::plan_compaction_job`]). Reads the input SST indexes to choose
     /// split points (see [`plan_subcompaction_ranges`]), so this is fallible.
+    /// When a compaction-filter supplier is installed, its `is_splittable`
+    /// property can force a single unbounded range for this job.
     ///
     /// ## Returns
     /// - The planned ranges or a single unbounded range when
@@ -578,11 +580,36 @@ impl TokioCompactionExecutorInner {
             &self.table_store,
             &args.l0_sst_views,
             &args.sorted_runs,
-            self.options.max_subcompactions,
+            self.max_subcompactions_for_job(args),
             self.options.max_fetch_tasks,
         )
         .await?;
         Ok(ranges.into_iter().map(Subcompaction::new).collect())
+    }
+
+    /// RFC-0028 split cap for this job. A supplier that declares the job
+    /// unsplittable forces a single range so a start-of-stream filter sees
+    /// the whole keyspace. Only consulted for fresh plans (`ctx` is `None`).
+    fn max_subcompactions_for_job(&self, args: &StartCompactionJobArgs) -> usize {
+        #[cfg(not(feature = "compaction_filters"))]
+        let _ = args;
+        #[cfg(feature = "compaction_filters")]
+        {
+            if let Some(supplier) = &self.compaction_filter_supplier {
+                use crate::compaction_filter::CompactionJobContext;
+                let context = CompactionJobContext {
+                    destination: args.destination,
+                    is_dest_last_run: args.is_dest_last_run,
+                    compaction_clock_tick: args.compaction_clock_tick,
+                    retention_min_seq: args.retention_min_seq,
+                    is_resume: false,
+                };
+                if !supplier.is_splittable(&context) {
+                    return 1;
+                }
+            }
+        }
+        self.options.max_subcompactions
     }
 
     /// Executes a compaction job's subcompactions (RFC-0028), running every
@@ -2478,6 +2505,125 @@ mod tests {
         assert!(n <= 4, "must not exceed max_subcompactions");
     }
 
+    /// Last-run itself is not the no-split constraint: without a supplier
+    /// declaring the job unsplittable, a sizable last-run still splits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn should_plan_split_on_last_run_without_unsplittable_supplier() {
+        let (executor, table_store, _rx) = subcompaction_env(
+            "testdb-plan-last-run-still-splits",
+            #[cfg(feature = "compaction_filters")]
+            None,
+        )
+        .await;
+        let (l0_sst_views, sorted_runs) = split_inputs(&table_store).await;
+        let args = StartCompactionJobArgs {
+            id: Ulid::new(),
+            compaction_id: Ulid::new(),
+            destination: 0,
+            l0_sst_views,
+            sorted_runs,
+            compaction_clock_tick: 0,
+            is_dest_last_run: true,
+            retention_min_seq: Some(0),
+            ctx: None,
+        };
+        let planned = executor.inner.plan_compaction_job(args).await.unwrap();
+        let n = planned.ctx.subcompactions().len();
+        assert!(
+            n > 1,
+            "last-run without an unsplittable supplier must still split, got {n}"
+        );
+    }
+
+    /// Addendum 26: supplier-declared unsplittable last-run plans one range
+    /// even when the inputs would otherwise split (RFC-0028).
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn should_plan_single_range_when_supplier_declares_last_run_unsplittable() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterDecision, CompactionFilterError,
+            CompactionFilterSupplier, CompactionJobContext,
+        };
+
+        struct KeepAllFilter;
+        #[async_trait::async_trait]
+        impl CompactionFilter for KeepAllFilter {
+            async fn filter(
+                &mut self,
+                _entry: &RowEntry,
+            ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+                Ok(CompactionFilterDecision::Keep)
+            }
+            async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+                Ok(())
+            }
+        }
+
+        struct UnsplittableLastRunSupplier;
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for UnsplittableLastRunSupplier {
+            fn is_splittable(&self, context: &CompactionJobContext) -> bool {
+                !context.is_dest_last_run
+            }
+            async fn create_compaction_filter(
+                &self,
+                _context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                Ok(Box::new(KeepAllFilter))
+            }
+        }
+
+        let (executor, table_store, _rx) = subcompaction_env(
+            "testdb-plan-unsplittable-last-run",
+            Some(Arc::new(UnsplittableLastRunSupplier)),
+        )
+        .await;
+        let (l0_sst_views, sorted_runs) = split_inputs(&table_store).await;
+        let last_run = StartCompactionJobArgs {
+            id: Ulid::new(),
+            compaction_id: Ulid::new(),
+            destination: 0,
+            l0_sst_views: l0_sst_views.clone(),
+            sorted_runs: sorted_runs.clone(),
+            compaction_clock_tick: 0,
+            is_dest_last_run: true,
+            retention_min_seq: Some(0),
+            ctx: None,
+        };
+        let planned = executor
+            .inner
+            .plan_compaction_job(last_run)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned.ctx.subcompactions().len(),
+            1,
+            "unsplittable last-run must plan a single range"
+        );
+        assert_eq!(
+            planned.ctx.subcompactions()[0].range(),
+            &BytesRange::unbounded()
+        );
+
+        let not_last = StartCompactionJobArgs {
+            id: Ulid::new(),
+            compaction_id: Ulid::new(),
+            destination: 0,
+            l0_sst_views,
+            sorted_runs,
+            compaction_clock_tick: 0,
+            is_dest_last_run: false,
+            retention_min_seq: Some(0),
+            ctx: None,
+        };
+        let planned = executor.inner.plan_compaction_job(not_last).await.unwrap();
+        let n = planned.ctx.subcompactions().len();
+        assert!(
+            n > 1,
+            "non-last-run with the same supplier must still split, got {n}"
+        );
+    }
+
     /// A blocked SST `close()` (the object-store flush of a finished output SST)
     /// must not stall the merge loop. We gate the object store's `put` so the
     /// first output SST's flush blocks indefinitely, then assert the executor
@@ -3447,6 +3593,172 @@ mod tests {
                 .contains("FTS compaction filter: unexpected phase Init"),
             "expected Init filter error, got {err}"
         );
+    }
+
+    /// Addendum 25 (a): last-run FTS filter is per-job Init, sentinel is
+    /// per-segment. A fresh split whose second range starts past the sentinel
+    /// Init-fails even with empty `output_ssts` (not a resume). Production-size
+    /// last-run FTS lanes can hit this without the resume bug.
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test]
+    async fn test_split_last_run_init_filter_fails_on_range_without_sentinel() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterDecision, CompactionFilterError,
+            CompactionFilterSupplier, CompactionJobContext,
+        };
+
+        const SENTINEL: &[u8] = b"aaa-sentinel";
+        const POSTING: &[u8] = b"bbb-posting";
+        const POSTING2: &[u8] = b"ccc-posting";
+
+        struct InitSentinelFilter {
+            seen_sentinel: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionFilter for InitSentinelFilter {
+            async fn filter(
+                &mut self,
+                entry: &RowEntry,
+            ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+                if entry.key.as_ref() == SENTINEL {
+                    self.seen_sentinel = true;
+                    return Ok(CompactionFilterDecision::Keep);
+                }
+                if !self.seen_sentinel {
+                    return Err(CompactionFilterError::FilterError(
+                        "FTS compaction filter: unexpected phase Init".into(),
+                    ));
+                }
+                Ok(CompactionFilterDecision::Keep)
+            }
+
+            async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+                Ok(())
+            }
+        }
+
+        struct InitSentinelFilterSupplier {
+            expect_resume: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for InitSentinelFilterSupplier {
+            async fn create_compaction_filter(
+                &self,
+                context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                assert!(
+                    context.is_dest_last_run,
+                    "this test installs the Init filter only on last-run, matching Vector"
+                );
+                assert_eq!(
+                    context.is_resume, self.expect_resume,
+                    "is_resume must match whether output_ssts were injected"
+                );
+                Ok(Box::new(InitSentinelFilter {
+                    seen_sentinel: false,
+                }))
+            }
+        }
+
+        async fn write_sst_entries(
+            table_store: &Arc<TableStore>,
+            entries: &[RowEntry],
+        ) -> SsTableHandle {
+            let mut sst_builder = table_store.table_builder();
+            for entry in entries {
+                sst_builder.add(entry.clone()).await.unwrap();
+            }
+            let encoded = sst_builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded, false)
+                .await
+                .unwrap()
+        }
+
+        fn init_err(err: &SlateDBError) {
+            assert!(
+                matches!(err, SlateDBError::CompactionFilterError(_)),
+                "expected CompactionFilterError, got: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("FTS compaction filter: unexpected phase Init"),
+                "expected Init filter error, got {err}"
+            );
+        }
+
+        let input_entries = [
+            RowEntry::new_value(SENTINEL, b"s", 1),
+            RowEntry::new_value(POSTING, b"p1", 2),
+            RowEntry::new_value(POSTING2, b"p2", 3),
+        ];
+
+        let first_ctx = TestContextBuilder::new("testdb_fts_split_first")
+            .with_compaction_filter_supplier(Arc::new(InitSentinelFilterSupplier {
+                expect_resume: false,
+            }))
+            .build()
+            .await;
+        let first_input = write_sst_entries(&first_ctx.table_store, &input_entries).await;
+        first_ctx
+            .run_compaction_with_ctx(
+                vec![first_input],
+                true,
+                None,
+                CompactionContext::new(
+                    vec![Subcompaction::new(BytesRange::from_slice(..POSTING))],
+                    None,
+                ),
+            )
+            .await
+            .expect("fresh last-run whose range includes the sentinel must succeed");
+
+        let rest_ctx = TestContextBuilder::new("testdb_fts_split_rest")
+            .with_compaction_filter_supplier(Arc::new(InitSentinelFilterSupplier {
+                expect_resume: false,
+            }))
+            .build()
+            .await;
+        let rest_input = write_sst_entries(&rest_ctx.table_store, &input_entries).await;
+        let rest_err = rest_ctx
+            .run_compaction_with_ctx(
+                vec![rest_input],
+                true,
+                None,
+                CompactionContext::new(
+                    vec![Subcompaction::new(BytesRange::from_slice(POSTING..))],
+                    None,
+                ),
+            )
+            .await
+            .expect_err("fresh last-run whose range excludes the sentinel must Init-fail");
+        init_err(&rest_err);
+
+        let split_ctx = TestContextBuilder::new("testdb_fts_split_job")
+            .with_compaction_filter_supplier(Arc::new(InitSentinelFilterSupplier {
+                expect_resume: false,
+            }))
+            .build()
+            .await;
+        let split_input = write_sst_entries(&split_ctx.table_store, &input_entries).await;
+        let split_err = split_ctx
+            .run_compaction_with_ctx(
+                vec![split_input],
+                true,
+                None,
+                CompactionContext::new(
+                    vec![
+                        Subcompaction::new(BytesRange::from_slice(..POSTING)),
+                        Subcompaction::new(BytesRange::from_slice(POSTING..)),
+                    ],
+                    None,
+                ),
+            )
+            .await
+            .expect_err("fresh split last-run must Init-fail on the range past the sentinel");
+        init_err(&split_err);
     }
 
     /// Supplier half: `is_resume` is visible at `create_compaction_filter`, so

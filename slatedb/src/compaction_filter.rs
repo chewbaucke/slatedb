@@ -225,4 +225,17 @@ pub trait CompactionFilterSupplier: Send + Sync {
         &self,
         context: &CompactionJobContext,
     ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError>;
+
+    /// Whether the planner may split this job into subcompactions (RFC-0028).
+    ///
+    /// Default `true`. Return `false` when the filter's phase machine requires
+    /// seeing the whole keyspace from the start (for example a start-of-stream
+    /// sentinel that sorts first in the segment). The planner then emits a
+    /// single unbounded range. A persisted multi-range plan is still reused on
+    /// resume; a filter-error restart from key zero clears that plan so the
+    /// next claim re-plans under this property.
+    fn is_splittable(&self, context: &CompactionJobContext) -> bool {
+        let _ = context;
+        true
+    }
 }

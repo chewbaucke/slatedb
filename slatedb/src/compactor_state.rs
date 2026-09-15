@@ -294,6 +294,9 @@ impl CompactionStatus {
     ///     shutdown). Adopt the release so the job can be re-claimed;
     ///     otherwise the coordinator's stale Running/claimed copy would be
     ///     written back and no worker would ever pick the job up again.
+    ///   - `Running → Failed` / `Scheduled → Failed`: a worker parked a
+    ///     livelocking compaction filter after bounded key-zero restarts.
+    ///     Adopt so the coordinator does not reclaim and reschedule it.
     ///   - `Running -> Running`: should accept heartbeat updates when heartbeats
     ///     land for a job that is already in local state
     ///
@@ -305,10 +308,13 @@ impl CompactionStatus {
     fn should_adopt_state_transition(&self, updated_status: CompactionStatus) -> bool {
         match self {
             Self::Submitted => matches!(updated_status, Self::Compacted),
-            Self::Scheduled => matches!(updated_status, Self::Running | Self::Compacted),
+            Self::Scheduled => matches!(
+                updated_status,
+                Self::Running | Self::Compacted | Self::Failed
+            ),
             Self::Running => matches!(
                 updated_status,
-                Self::Scheduled | Self::Running | Self::Compacted
+                Self::Scheduled | Self::Running | Self::Compacted | Self::Failed
             ),
             Self::Compacted => matches!(updated_status, Self::Compacted),
             Self::Completed | Self::Failed => false,
@@ -1482,6 +1488,32 @@ mod tests {
         assert_eq!(
             merged.get(&id).expect("not found").status(),
             CompactionStatus::Compacted
+        );
+    }
+
+    #[test]
+    fn test_merge_remote_compactions_accepts_failed_from_worker_park() {
+        let manifest = new_dirty_manifest();
+        let compactor_epoch = manifest.value.compactor_epoch;
+        let id = Ulid::from_parts(1, 0);
+
+        let mut local_compactions = new_dirty_compactions(compactor_epoch);
+        local_compactions
+            .value
+            .insert(compaction_with_status(id, CompactionStatus::Running));
+        let mut state = CompactorState::new(manifest, local_compactions);
+
+        let mut remote_compactions = new_dirty_compactions(compactor_epoch);
+        remote_compactions
+            .value
+            .insert(compaction_with_status(id, CompactionStatus::Failed));
+
+        state.merge_remote_compactions(remote_compactions);
+
+        let merged = &state.compactions.value;
+        assert_eq!(
+            merged.get(&id).expect("not found").status(),
+            CompactionStatus::Failed
         );
     }
 
