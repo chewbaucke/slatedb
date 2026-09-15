@@ -87,6 +87,12 @@ use slatedb_common::DbRand;
 
 pub(crate) const COMPACTION_WORKER_TASK_NAME: &str = "compaction_worker";
 
+/// In-process bound on FilterError → key-zero restarts of the same compaction
+/// id. An always-erroring filter otherwise loops expensive-from-key-zero
+/// forever and stalls the flush path (Addendum 25). After this many restarts
+/// the job is parked as [`CompactionStatus::Failed`] (visible, not retried).
+const FILTER_ERROR_RESTART_LIMIT: u32 = 8;
+
 fn is_compaction_filter_error(err: &SlateDBError) -> bool {
     #[cfg(feature = "compaction_filters")]
     {
@@ -206,6 +212,10 @@ pub(crate) struct CompactionWorkerHandler {
     /// [`Self::heartbeat_owned_jobs`]); progress reports themselves never
     /// write.
     job_progress: BTreeMap<Ulid, Option<CompactionContext>>,
+    /// FilterError→key-zero restart counts for jobs this process has seen.
+    /// Used to park a livelocking filter as Failed after
+    /// [`FILTER_ERROR_RESTART_LIMIT`] attempts.
+    filter_error_restarts: BTreeMap<Ulid, u32>,
 }
 
 impl CompactionWorkerHandler {
@@ -230,6 +240,7 @@ impl CompactionWorkerHandler {
             rand,
             fp_registry,
             job_progress: BTreeMap::new(),
+            filter_error_restarts: BTreeMap::new(),
         }
     }
 
@@ -640,7 +651,10 @@ impl CompactionWorkerHandler {
                 .with_ctx(None);
             dirty.value.insert(updated);
             match stored.update(dirty).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.filter_error_restarts.remove(&compaction_id);
+                    return Ok(());
+                }
                 Err(e) if e.is_sequenced_write_conflict() => continue,
                 Err(e) => return Err(e),
             }
@@ -671,12 +685,27 @@ impl CompactionWorkerHandler {
     /// than a resume from the same cursor. Compaction-filter errors take this
     /// path: a new filter instance cannot observe keys already written, and
     /// retrying the same cursor livelocks stateful filters.
+    ///
+    /// After [`FILTER_ERROR_RESTART_LIMIT`] key-zero restarts of the same id
+    /// in this process, the job is parked [`CompactionStatus::Failed`] so an
+    /// always-erroring filter cannot stall the flush path forever.
     async fn release_claim(
         &mut self,
         compaction_id: Ulid,
         restart_from_key_zero: bool,
     ) -> Result<(), SlateDBError> {
         let worker_id = self.worker_id.as_str();
+        let (restart_count, park) = if restart_from_key_zero {
+            let next = self
+                .filter_error_restarts
+                .get(&compaction_id)
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            (Some(next), next > FILTER_ERROR_RESTART_LIMIT)
+        } else {
+            (None, false)
+        };
         loop {
             let stored = self.stored.as_mut().expect(Self::EXPECT_LOADED);
             stored.refresh().await?;
@@ -699,20 +728,43 @@ impl CompactionWorkerHandler {
                 );
                 return Ok(());
             }
-            let mut updated = existing
-                .with_status(CompactionStatus::Scheduled)
-                .with_worker(None);
+            let mut updated = if park {
+                existing
+                    .with_status(CompactionStatus::Failed)
+                    .with_worker(None)
+            } else {
+                existing
+                    .with_status(CompactionStatus::Scheduled)
+                    .with_worker(None)
+            };
             if restart_from_key_zero {
-                info!(
-                    "rescheduling compaction from key zero after filter error [worker_id]={} [compaction_id]={}",
-                    worker_id, compaction_id
-                );
+                let count = restart_count.expect("restart count set with key-zero");
+                if park {
+                    warn!(
+                        "parking compaction after filter-error restart limit [worker_id]={} [compaction_id]={} [restarts]={} [limit]={}",
+                        worker_id, compaction_id, count, FILTER_ERROR_RESTART_LIMIT
+                    );
+                } else {
+                    warn!(
+                        "rescheduling compaction from key zero after filter error [worker_id]={} [compaction_id]={} [restarts]={} [limit]={}",
+                        worker_id, compaction_id, count, FILTER_ERROR_RESTART_LIMIT
+                    );
+                }
                 updated = updated.with_ctx(None);
                 updated.set_bytes_processed(0);
             }
             dirty.value.insert(updated);
             match stored.update(dirty).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if restart_from_key_zero {
+                        if park {
+                            self.filter_error_restarts.remove(&compaction_id);
+                        } else if let Some(count) = restart_count {
+                            self.filter_error_restarts.insert(compaction_id, count);
+                        }
+                    }
+                    return Ok(());
+                }
                 Err(e) if e.is_sequenced_write_conflict() => continue,
                 Err(e) => return Err(e),
             }
@@ -1249,6 +1301,59 @@ mod tests {
         );
         assert_eq!(c.bytes_processed(), 0);
         assert!(!fx.handler.job_progress.contains_key(&id));
+    }
+
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test]
+    async fn test_worker_parks_after_filter_error_restart_limit() {
+        // N FilterError key-zero restarts stay Scheduled with ctx cleared;
+        // N+1 parks Failed so an always-erroring filter cannot livelock the
+        // flush path (Addendum 25).
+        let mut fx = WorkerFixture::new("worker-A").await;
+        let id = Ulid::from_parts(1, 0);
+        let spec = CompactionSpec::new(vec![SourceId::SstView(fx.l0_view.id)], 0);
+        let compaction = Compaction::new(id, spec).with_status(CompactionStatus::Scheduled);
+        let mut stored = StoredCompactions::try_load(fx.compactions_store.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut dirty = stored.prepare_dirty().unwrap();
+        dirty.value.insert(compaction);
+        stored.update(dirty).await.unwrap();
+
+        let init_err = || {
+            crate::compaction_filter::CompactionFilterError::FilterError(
+                "FTS compaction filter: unexpected phase Init".into(),
+            )
+            .into()
+        };
+
+        for i in 1..=FILTER_ERROR_RESTART_LIMIT {
+            fx.handler.poll_and_claim().await.unwrap();
+            fx.handler.handle_finished(id, Err(init_err())).await.unwrap();
+            let c = fx.read_compaction(id).await.expect("compaction missing");
+            assert_eq!(
+                c.status(),
+                CompactionStatus::Scheduled,
+                "restart {i} must stay Scheduled"
+            );
+            assert!(c.ctx().is_none());
+            assert!(c.worker().is_none());
+        }
+
+        fx.handler.poll_and_claim().await.unwrap();
+        fx.handler.handle_finished(id, Err(init_err())).await.unwrap();
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Failed);
+        assert!(c.ctx().is_none());
+        assert!(c.worker().is_none());
+        assert!(!fx.handler.job_progress.contains_key(&id));
+
+        fx.handler.poll_and_claim().await.unwrap();
+        assert!(
+            !fx.handler.job_progress.contains_key(&id),
+            "Failed jobs must not be reclaimed"
+        );
     }
 
     #[tokio::test]

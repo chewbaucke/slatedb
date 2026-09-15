@@ -1402,7 +1402,8 @@ pub struct CompactionWorkerOptions {
     /// into fewer (or zero) ranges rather than fragmented into undersized
     /// SSTs. There is deliberately no separate minimum-size knob; the
     /// [`max_sst_size`](CompactionWorkerOptions::max_sst_size) floor subsumes
-    /// it.
+    /// it. A compaction-filter supplier may declare a job unsplittable; the
+    /// planner then emits a single unbounded range regardless of this cap.
     pub max_subcompactions: usize,
 
     /// Write SSTables with a bloom filter if the number of keys in the SSTable
