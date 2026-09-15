@@ -424,6 +424,7 @@ impl TokioCompactionExecutorInner {
                 is_dest_last_run: job_args.is_dest_last_run,
                 compaction_clock_tick: job_args.compaction_clock_tick,
                 retention_min_seq,
+                is_resume: resume_cursor.is_some(),
             };
             let filter = supplier.create_compaction_filter(&context).await?;
             let filter_iter = CompactionFilterIterator::new(retention_iter, filter);
@@ -2900,6 +2901,41 @@ mod tests {
             .await
             .unwrap()
         }
+
+        /// Like [`Self::run_compaction`], but starts from a persisted resume
+        /// context (subcompaction `output_ssts` already written). Used to force
+        /// a last-run FTS-shaped filter plus a cursor past the sentinel.
+        async fn run_compaction_with_ctx(
+            self,
+            ssts: Vec<SsTableHandle>,
+            is_dest_last_run: bool,
+            retention_min_seq: Option<u64>,
+            ctx: CompactionContext,
+        ) -> Result<SortedRun, SlateDBError> {
+            let compaction = StartCompactionJobArgs {
+                id: Ulid::new(),
+                compaction_id: Ulid::new(),
+                destination: 0,
+                l0_sst_views: ssts.into_iter().map(SsTableView::identity).collect(),
+                sorted_runs: vec![],
+                compaction_clock_tick: 0,
+                is_dest_last_run,
+                retention_min_seq,
+                ctx: Some(ctx),
+            };
+            self.executor.start_compaction_job(compaction);
+
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                loop {
+                    let msg = self.rx.recv().await.unwrap();
+                    if let WorkerMessage::CompactionJobFinished { id: _, result } = msg {
+                        return result;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3256,6 +3292,265 @@ mod tests {
             matches!(err, SlateDBError::CompactionFilterError(_)),
             "Expected CompactionFilterError, got: {:?}",
             err
+        );
+    }
+
+    /// Vector's last-run FTS filter is born `Init` and only the deletions
+    /// sentinel may leave that phase. SlateDB wraps a *fresh* filter in
+    /// `ResumingIterator` (`load_iterators`); `CompactionFilterIterator::seek`
+    /// does not call `filter`, so a cursor whose last output key is *past* the
+    /// sentinel never observes it. [`CompactionJobContext::is_resume`] exposes
+    /// that.
+    ///
+    /// A sentinel-only checkpoint would *not* reproduce Init: peek/next on the
+    /// resume key still applies the filter, so the sentinel itself would
+    /// advance the phase. The checkpoint's last key must be a later key.
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test]
+    async fn test_resumed_last_run_init_filter_fails_past_sentinel() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterDecision, CompactionFilterError,
+            CompactionFilterSupplier, CompactionJobContext,
+        };
+
+        const SENTINEL: &[u8] = b"aaa-sentinel";
+        const POSTING: &[u8] = b"bbb-posting";
+        const POSTING2: &[u8] = b"ccc-posting";
+
+        /// Vector-shaped: only `aaa-sentinel` may leave Init. Any other key in
+        /// Init is the documented `unexpected phase Init` error.
+        struct InitSentinelFilter {
+            seen_sentinel: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionFilter for InitSentinelFilter {
+            async fn filter(
+                &mut self,
+                entry: &RowEntry,
+            ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+                if entry.key.as_ref() == SENTINEL {
+                    self.seen_sentinel = true;
+                    return Ok(CompactionFilterDecision::Keep);
+                }
+                if !self.seen_sentinel {
+                    return Err(CompactionFilterError::FilterError(
+                        "FTS compaction filter: unexpected phase Init".into(),
+                    ));
+                }
+                Ok(CompactionFilterDecision::Keep)
+            }
+
+            async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+                Ok(())
+            }
+        }
+
+        struct InitSentinelFilterSupplier {
+            expect_resume: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for InitSentinelFilterSupplier {
+            async fn create_compaction_filter(
+                &self,
+                context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                let CompactionJobContext {
+                    destination: _,
+                    is_dest_last_run: _,
+                    compaction_clock_tick: _,
+                    retention_min_seq: _,
+                    is_resume: _,
+                } = context;
+                assert!(
+                    context.is_dest_last_run,
+                    "this test installs the Init filter only on last-run, matching Vector"
+                );
+                assert_eq!(
+                    context.is_resume, self.expect_resume,
+                    "is_resume must match whether output_ssts were injected"
+                );
+                Ok(Box::new(InitSentinelFilter {
+                    seen_sentinel: false,
+                }))
+            }
+        }
+
+        async fn write_sst_entries(
+            table_store: &Arc<TableStore>,
+            entries: &[RowEntry],
+        ) -> SsTableHandle {
+            let mut sst_builder = table_store.table_builder();
+            for entry in entries {
+                sst_builder.add(entry.clone()).await.unwrap();
+            }
+            let encoded = sst_builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded, false)
+                .await
+                .unwrap()
+        }
+
+        let input_entries = [
+            RowEntry::new_value(SENTINEL, b"s", 1),
+            RowEntry::new_value(POSTING, b"p1", 2),
+            RowEntry::new_value(POSTING2, b"p2", 3),
+        ];
+
+        let fresh_ctx = TestContextBuilder::new("testdb_fts_init_fresh")
+            .with_compaction_filter_supplier(Arc::new(InitSentinelFilterSupplier {
+                expect_resume: false,
+            }))
+            .build()
+            .await;
+        let fresh_input = write_sst_entries(&fresh_ctx.table_store, &input_entries).await;
+        fresh_ctx
+            .run_compaction(vec![fresh_input], true, None)
+            .await
+            .expect("fresh last-run Init filter must see the sentinel and succeed");
+
+        let resume_ctx = TestContextBuilder::new("testdb_fts_init_resume")
+            .with_compaction_filter_supplier(Arc::new(InitSentinelFilterSupplier {
+                expect_resume: true,
+            }))
+            .build()
+            .await;
+        let resume_input = write_sst_entries(&resume_ctx.table_store, &input_entries).await;
+        let checkpoint = write_sst_entries(
+            &resume_ctx.table_store,
+            &[
+                RowEntry::new_value(SENTINEL, b"s", 1),
+                RowEntry::new_value(POSTING, b"p1", 2),
+            ],
+        )
+        .await;
+        let err = resume_ctx
+            .run_compaction_with_ctx(
+                vec![resume_input],
+                true,
+                None,
+                CompactionContext::new(
+                    vec![Subcompaction::new(BytesRange::unbounded())
+                        .with_output_ssts(vec![checkpoint])],
+                    None,
+                ),
+            )
+            .await
+            .expect_err("resume past sentinel must fail closed");
+        assert!(
+            matches!(err, SlateDBError::CompactionFilterError(_)),
+            "expected CompactionFilterError, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("FTS compaction filter: unexpected phase Init"),
+            "expected Init filter error, got {err}"
+        );
+    }
+
+    /// Supplier half: `is_resume` is visible at `create_compaction_filter`, so
+    /// a last-run supplier can fail closed with CreationError instead of
+    /// installing a fresh Init filter.
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test]
+    async fn test_last_run_supplier_fails_closed_on_resume() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterDecision, CompactionFilterError,
+            CompactionFilterSupplier, CompactionJobContext,
+        };
+
+        struct FailResumedLastRunSupplier;
+
+        #[async_trait::async_trait]
+        impl CompactionFilter for FailResumedLastRunSupplier {
+            async fn filter(
+                &mut self,
+                _entry: &RowEntry,
+            ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+                Ok(CompactionFilterDecision::Keep)
+            }
+
+            async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+                Ok(())
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for FailResumedLastRunSupplier {
+            async fn create_compaction_filter(
+                &self,
+                context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                if context.is_dest_last_run && context.is_resume {
+                    return Err(CompactionFilterError::CreationError(
+                        "FTS compaction filter: refusing resumed last-run job".into(),
+                    ));
+                }
+                Ok(Box::new(FailResumedLastRunSupplier))
+            }
+        }
+
+        async fn write_sst_entries(
+            table_store: &Arc<TableStore>,
+            entries: &[RowEntry],
+        ) -> SsTableHandle {
+            let mut sst_builder = table_store.table_builder();
+            for entry in entries {
+                sst_builder.add(entry.clone()).await.unwrap();
+            }
+            let encoded = sst_builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded, false)
+                .await
+                .unwrap()
+        }
+
+        let entries = [
+            RowEntry::new_value(b"aaa-sentinel", b"s", 1),
+            RowEntry::new_value(b"bbb-posting", b"p1", 2),
+        ];
+
+        let fresh = TestContextBuilder::new("testdb_a_fresh")
+            .with_compaction_filter_supplier(Arc::new(FailResumedLastRunSupplier))
+            .build()
+            .await;
+        let fresh_input = write_sst_entries(&fresh.table_store, &entries).await;
+        fresh
+            .run_compaction(vec![fresh_input], true, None)
+            .await
+            .expect("fresh last-run must install the filter and succeed");
+
+        let resume = TestContextBuilder::new("testdb_a_resume")
+            .with_compaction_filter_supplier(Arc::new(FailResumedLastRunSupplier))
+            .build()
+            .await;
+        let resume_input = write_sst_entries(&resume.table_store, &entries).await;
+        let checkpoint = write_sst_entries(
+            &resume.table_store,
+            &[RowEntry::new_value(b"aaa-sentinel", b"s", 1)],
+        )
+        .await;
+        let err = resume
+            .run_compaction_with_ctx(
+                vec![resume_input],
+                true,
+                None,
+                CompactionContext::new(
+                    vec![Subcompaction::new(BytesRange::unbounded())
+                        .with_output_ssts(vec![checkpoint])],
+                    None,
+                ),
+            )
+            .await
+            .expect_err("resumed last-run must fail at the supplier");
+        assert!(
+            matches!(err, SlateDBError::CompactionFilterError(_)),
+            "expected CompactionFilterError, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("refusing resumed last-run job"),
+            "expected supplier CreationError, got {err}"
         );
     }
 }

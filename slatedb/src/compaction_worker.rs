@@ -93,6 +93,18 @@ use slatedb_common::DbRand;
 
 pub(crate) const COMPACTION_WORKER_TASK_NAME: &str = "compaction_worker";
 
+fn is_compaction_filter_error(err: &SlateDBError) -> bool {
+    #[cfg(feature = "compaction_filters")]
+    {
+        matches!(err, SlateDBError::CompactionFilterError(_))
+    }
+    #[cfg(not(feature = "compaction_filters"))]
+    {
+        let _ = err;
+        false
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum WorkerMessage {
     /// Signals that a compaction job has finished execution.
@@ -432,7 +444,7 @@ impl CompactionWorkerHandler {
                         compaction.id(),
                         e
                     );
-                    self.release_claim(compaction.id()).await?;
+                    self.release_claim(compaction.id(), false).await?;
                 }
             }
         }
@@ -799,7 +811,17 @@ impl CompactionWorkerHandler {
 
     /// Returns a claim to `Scheduled` so it can be re-attempted by any worker
     /// (used when execution fails or when the worker shuts down gracefully).
-    async fn release_claim(&mut self, compaction_id: Ulid) -> Result<(), SlateDBError> {
+    ///
+    /// When `restart_from_key_zero` is true, persisted subcompaction
+    /// `output_ssts` are cleared so the next attempt is a fresh merge rather
+    /// than a resume from the same cursor. Compaction-filter errors take this
+    /// path: a new filter instance cannot observe keys already written, and
+    /// retrying the same cursor livelocks stateful filters.
+    async fn release_claim(
+        &mut self,
+        compaction_id: Ulid,
+        restart_from_key_zero: bool,
+    ) -> Result<(), SlateDBError> {
         let worker_id = self.worker_id.as_str();
         loop {
             let stored = self.stored.as_mut().expect(Self::EXPECT_LOADED);
@@ -823,9 +845,17 @@ impl CompactionWorkerHandler {
                 );
                 return Ok(());
             }
-            let updated = existing
+            let mut updated = existing
                 .with_status(CompactionStatus::Scheduled)
                 .with_worker(None);
+            if restart_from_key_zero {
+                info!(
+                    "rescheduling compaction from key zero after filter error [worker_id]={} [compaction_id]={}",
+                    worker_id, compaction_id
+                );
+                updated = updated.with_ctx(None);
+                updated.set_bytes_processed(0);
+            }
             dirty.value.insert(updated);
             match stored.update(dirty).await {
                 Ok(()) => return Ok(()),
@@ -845,7 +875,8 @@ impl CompactionWorkerHandler {
             Ok(sorted_run) => self.write_compacted(id, sorted_run).await?,
             Err(e) => {
                 error!("compaction job failed [id={}, error={:?}]", id, e);
-                self.release_claim(id).await?;
+                self.release_claim(id, is_compaction_filter_error(&e))
+                    .await?;
             }
         }
         Ok(())
@@ -913,7 +944,7 @@ impl MessageHandler<WorkerMessage> for CompactionWorkerHandler {
         self.executor.stop();
         let claimed = std::mem::take(&mut self.job_progress);
         for id in claimed.into_keys() {
-            if let Err(e) = self.release_claim(id).await {
+            if let Err(e) = self.release_claim(id, false).await {
                 error!(
                     "failed to release claim on shutdown [worker_id={}, id={}, error={:?}]",
                     self.worker_id, id, e
@@ -1304,6 +1335,107 @@ mod tests {
         assert_eq!(c.status(), CompactionStatus::Scheduled);
         assert!(c.worker().is_none());
         assert!(!fx.handler.job_progress.contains_key(&id));
+    }
+
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test]
+    async fn test_worker_restarts_from_key_zero_on_filter_error() {
+        // A filter/supplier error must drop persisted output_ssts so the next
+        // claim is a fresh merge. Retrying the same cursor livelocks a
+        // stateful last-run filter.
+        let mut fx = WorkerFixture::new("worker-A").await;
+        let id = Ulid::from_parts(1, 0);
+        let sst1 = fake_output_handle(Ulid::from_parts(9100, 0));
+        let spec = CompactionSpec::new(vec![SourceId::SstView(fx.l0_view.id)], 0);
+        let compaction = Compaction::new(id, spec)
+            .with_status(CompactionStatus::Scheduled)
+            .with_ctx(Some(CompactionContext::new(
+                vec![Subcompaction::new(BytesRange::unbounded())
+                    .with_output_ssts(vec![sst1.clone()])],
+                Some(0),
+            )));
+        let mut stored = StoredCompactions::try_load(fx.compactions_store.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut dirty = stored.prepare_dirty().unwrap();
+        dirty.value.insert(compaction);
+        stored.update(dirty).await.unwrap();
+
+        fx.handler.poll_and_claim().await.unwrap();
+        assert_eq!(
+            fx.handler
+                .job_progress
+                .get(&id)
+                .expect("claimed")
+                .last_hb_ctx
+                .as_ref()
+                .expect("ctx")
+                .subcompactions()[0]
+                .output_ssts()
+                .len(),
+            1
+        );
+
+        fx.handler
+            .handle_finished(
+                id,
+                Err(
+                    crate::compaction_filter::CompactionFilterError::FilterError(
+                        "FTS compaction filter: unexpected phase Init".into(),
+                    )
+                    .into(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Scheduled);
+        assert!(c.worker().is_none());
+        assert!(
+            c.ctx().is_none(),
+            "filter error must clear resume ctx so the next attempt starts at key zero"
+        );
+        assert_eq!(c.bytes_processed(), 0);
+        assert!(!fx.handler.job_progress.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn test_worker_preserves_resume_ctx_on_non_filter_failure() {
+        // RFC-0028 resume stays in place for non-filter failures (IO, invalid
+        // state). Only CompactionFilterError restarts from key zero.
+        let mut fx = WorkerFixture::new("worker-A").await;
+        let id = Ulid::from_parts(1, 0);
+        let sst1 = fake_output_handle(Ulid::from_parts(9100, 0));
+        let spec = CompactionSpec::new(vec![SourceId::SstView(fx.l0_view.id)], 0);
+        let compaction = Compaction::new(id, spec)
+            .with_status(CompactionStatus::Scheduled)
+            .with_ctx(Some(CompactionContext::new(
+                vec![Subcompaction::new(BytesRange::unbounded())
+                    .with_output_ssts(vec![sst1.clone()])],
+                Some(0),
+            )));
+        let mut stored = StoredCompactions::try_load(fx.compactions_store.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut dirty = stored.prepare_dirty().unwrap();
+        dirty.value.insert(compaction);
+        stored.update(dirty).await.unwrap();
+
+        fx.handler.poll_and_claim().await.unwrap();
+        fx.handler
+            .handle_finished(id, Err(SlateDBError::InvalidDBState))
+            .await
+            .unwrap();
+
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Scheduled);
+        assert!(c.worker().is_none());
+        let ctx = c.ctx().expect("non-filter failure must keep resume ctx");
+        assert_eq!(ctx.subcompactions()[0].output_ssts().len(), 1);
+        assert_eq!(ctx.subcompactions()[0].output_ssts()[0].id, sst1.id);
     }
 
     #[tokio::test]
