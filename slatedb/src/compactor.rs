@@ -967,6 +967,7 @@ impl CompactorEventHandler {
             SourceId::SstView(id) => !l0_view_ids.contains(id),
             SourceId::SortedRun(id) => !sr_ids.contains(id),
         }) {
+            self.stats.source_missing.increment(1);
             warn!("compaction source missing from db state: {:?}", missing);
             return Err(SlateDBError::InvalidCompaction);
         }
@@ -1297,6 +1298,8 @@ pub mod stats {
     pub const SSTS_WRITTEN: &str = compactor_stat_name!("ssts_written");
     pub const JOBS_CLAIMED: &str = compactor_stat_name!("jobs_claimed");
     pub const JOBS_RECLAIMED: &str = compactor_stat_name!("jobs_reclaimed");
+    /// Scheduler race: compaction sources vanished from the live tree.
+    pub const SOURCE_MISSING: &str = compactor_stat_name!("source_missing");
     pub const WORKER_LAST_HEARTBEAT_MS: &str = compactor_stat_name!("worker_last_heartbeat_ms");
     /// Label key carrying a worker's id on per-worker metrics.
     pub const WORKER_ID_LABEL: &str = "worker_id";
@@ -1332,6 +1335,8 @@ pub mod stats {
         pub(crate) jobs_claimed: Arc<dyn CounterFn>,
         /// Stale jobs the coordinator reset `Running → Submitted`.
         pub(crate) jobs_reclaimed: Arc<dyn CounterFn>,
+        /// Compaction sources missing from the live tree (scheduler churn).
+        pub(crate) source_missing: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1341,6 +1346,7 @@ pub mod stats {
                 last_compaction_ts: recorder.gauge(LAST_COMPACTION_TS_SEC).register(),
                 jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
                 jobs_reclaimed: recorder.counter(JOBS_RECLAIMED).register(),
+                source_missing: recorder.counter(SOURCE_MISSING).register(),
                 total_bytes_being_compacted: recorder.gauge(TOTAL_BYTES_BEING_COMPACTED).register(),
                 total_throughput: recorder.gauge(TOTAL_THROUGHPUT_BYTES_PER_SEC).register(),
                 merge_operator_compact_operands: recorder
