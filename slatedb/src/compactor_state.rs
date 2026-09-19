@@ -1048,7 +1048,11 @@ impl CompactorState {
         let mut db_state = self.db_state().clone();
         if let Some(compaction) = self.compactions.value.get_mut(&compaction_id) {
             let spec = compaction.spec();
-            info!("finished compaction [spec={}]", spec);
+            info!(
+                "finished compaction [spec={}, bytes_processed={}]",
+                spec,
+                compaction.bytes_processed()
+            );
             // Tiered finish path; drain specs are completed via
             // `finish_drain_compaction` and never reach here.
             let dst = spec

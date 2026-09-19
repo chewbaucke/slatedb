@@ -883,10 +883,8 @@ impl CompactorEventHandler {
                             .map(|sst| SsTableView::identity(sst.clone()))
                             .collect(),
                     };
+                    self.record_compaction_finish(&compaction);
                     self.state_mut().finish_compaction(id, output_sr);
-                    self.stats
-                        .last_compaction_ts
-                        .set(self.system_clock.now().timestamp());
                 }
                 Err(_) => {
                     // Validation failed against the current manifest. Mark Failed so the
@@ -1248,10 +1246,39 @@ impl CompactorEventHandler {
         self.state_writer.write_state_safely().await?;
         self.maybe_schedule_compactions().await?;
         self.maybe_validate_submitted_compactions().await?;
+        // Dead-code coordinator path: no Compacted snapshot here. Timestamp
+        // still moves; duration/bytes ride `commit_compacted_entries`.
         self.stats
             .last_compaction_ts
             .set(self.system_clock.now().timestamp());
         Ok(())
+    }
+
+    /// Last-unit duration/bytes for the sampler. Survives `slatedb=warn`.
+    fn record_compaction_finish(&self, compaction: &Compaction) {
+        let now = self.system_clock.now();
+        let start_ms = compaction
+            .id()
+            .datetime()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let duration_ms = (now.timestamp_millis() as u64).saturating_sub(start_ms);
+        let processed = compaction.bytes_processed();
+        let output_bytes: u64 = compaction
+            .output_ssts()
+            .iter()
+            .map(|sst| sst.info.filter_offset as u64)
+            .sum();
+        let bytes = if processed > 0 { processed } else { output_bytes };
+        self.stats
+            .record_finished(duration_ms, bytes, now.timestamp());
+        info!(
+            "compaction unit [id={}, duration_ms={}, bytes={}]",
+            compaction.id(),
+            duration_ms,
+            bytes
+        );
     }
 
     /// Logs the current DB runs and in-flight compactions.
@@ -1294,6 +1321,13 @@ pub mod stats {
     pub const BYTES_COMPACTED: &str = compactor_stat_name!("bytes_compacted");
     pub const COMPACTOR_EPOCH: &str = compactor_stat_name!("epoch");
     pub const LAST_COMPACTION_TS_SEC: &str = compactor_stat_name!("last_compaction_timestamp_sec");
+    /// Wall time of the last finished job (ULID start → commit). Sampler-scraped;
+    /// `info!` completion logs are hidden when `RUST_LOG` sets `slatedb=warn`.
+    pub const LAST_COMPACTION_DURATION_MS: &str =
+        compactor_stat_name!("last_compaction_duration_ms");
+    /// Bytes of the last finished job (`bytes_processed`, else output SST sizes).
+    pub const LAST_COMPACTION_BYTES: &str = compactor_stat_name!("last_compaction_bytes");
+    pub const COMPACTIONS_FINISHED: &str = compactor_stat_name!("compactions_finished");
     pub const RUNNING_COMPACTIONS: &str = compactor_stat_name!("running_compactions");
     pub const SSTS_WRITTEN: &str = compactor_stat_name!("ssts_written");
     pub const JOBS_CLAIMED: &str = compactor_stat_name!("jobs_claimed");
@@ -1326,6 +1360,8 @@ pub mod stats {
     pub(crate) struct CompactionStats {
         pub(crate) compactor_epoch: Arc<dyn GaugeFn>,
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
+        pub(crate) last_compaction_duration_ms: Arc<dyn GaugeFn>,
+        pub(crate) last_compaction_bytes: Arc<dyn GaugeFn>,
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
         pub(crate) merge_operator_compact_operands: Arc<dyn CounterFn>,
@@ -1337,6 +1373,7 @@ pub mod stats {
         pub(crate) jobs_reclaimed: Arc<dyn CounterFn>,
         /// Compaction sources missing from the live tree (scheduler churn).
         pub(crate) source_missing: Arc<dyn CounterFn>,
+        pub(crate) compactions_finished: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1344,9 +1381,14 @@ pub mod stats {
             Self {
                 compactor_epoch: recorder.gauge(COMPACTOR_EPOCH).register(),
                 last_compaction_ts: recorder.gauge(LAST_COMPACTION_TS_SEC).register(),
+                last_compaction_duration_ms: recorder
+                    .gauge(LAST_COMPACTION_DURATION_MS)
+                    .register(),
+                last_compaction_bytes: recorder.gauge(LAST_COMPACTION_BYTES).register(),
                 jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
                 jobs_reclaimed: recorder.counter(JOBS_RECLAIMED).register(),
                 source_missing: recorder.counter(SOURCE_MISSING).register(),
+                compactions_finished: recorder.counter(COMPACTIONS_FINISHED).register(),
                 total_bytes_being_compacted: recorder.gauge(TOTAL_BYTES_BEING_COMPACTED).register(),
                 total_throughput: recorder.gauge(TOTAL_THROUGHPUT_BYTES_PER_SEC).register(),
                 merge_operator_compact_operands: recorder
@@ -1365,6 +1407,18 @@ pub mod stats {
                     .description(EXPIRED_ENTRIES_PURGED_DESCRIPTION)
                     .register(),
             }
+        }
+
+        pub(crate) fn record_finished(
+            &self,
+            duration_ms: u64,
+            bytes: u64,
+            now_ts_sec: i64,
+        ) {
+            self.last_compaction_duration_ms.set(duration_ms as i64);
+            self.last_compaction_bytes.set(bytes as i64);
+            self.last_compaction_ts.set(now_ts_sec);
+            self.compactions_finished.increment(1);
         }
 
         pub(crate) fn retention_metrics(&self) -> crate::retention_iterator::RetentionMetrics {
@@ -1437,6 +1491,8 @@ mod tests {
     use crate::compactions_store::{FenceableCompactions, StoredCompactions};
     use crate::compactor::stats::CompactionStats;
     use crate::compactor::stats::COMPACTOR_EPOCH;
+    use crate::compactor::stats::LAST_COMPACTION_BYTES;
+    use crate::compactor::stats::LAST_COMPACTION_DURATION_MS;
     use crate::compactor::stats::LAST_COMPACTION_TS_SEC;
     use crate::compactor_executor::{
         CompactionExecutor, TokioCompactionExecutor, TokioCompactionExecutorOptions,
@@ -4786,6 +4842,22 @@ mod tests {
             slatedb_common::metrics::lookup_metric(&fixture.test_recorder, LAST_COMPACTION_TS_SEC)
                 .expect("metric not found");
         assert!(last_ts > starting_last_ts);
+        let duration_ms = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            LAST_COMPACTION_DURATION_MS,
+        )
+        .expect("duration gauge missing");
+        assert!(
+            duration_ms >= 0,
+            "last_compaction_duration_ms should be present, got {duration_ms}"
+        );
+        let bytes =
+            slatedb_common::metrics::lookup_metric(&fixture.test_recorder, LAST_COMPACTION_BYTES)
+                .expect("bytes gauge missing");
+        assert!(
+            bytes >= 0,
+            "last_compaction_bytes should be present, got {bytes}"
+        );
     }
 
     #[tokio::test]
