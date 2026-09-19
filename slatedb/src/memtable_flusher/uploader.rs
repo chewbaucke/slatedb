@@ -26,7 +26,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use log::{info, warn};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 const UPLOADER_TASK_NAME: &str = "l0_sst_uploader";
@@ -77,6 +77,10 @@ pub(crate) struct UploadedMemtable {
     pub(crate) first_seq: u64,
     /// Highest sequence number present in the immutable memtable.
     pub(crate) last_seq: u64,
+    /// Wall time of `build_imm_ssts` (encode) for this unit. Zero in tests.
+    pub(crate) encode_ms: u64,
+    /// Wall time of parallel SST PUT (`try_join_all`), including retries.
+    pub(crate) upload_ms: u64,
 }
 
 impl UploadedMemtable {
@@ -96,6 +100,8 @@ impl UploadedMemtable {
             }],
             first_seq,
             last_seq,
+            encode_ms: 0,
+            upload_ms: 0,
         }
     }
 }
@@ -180,7 +186,9 @@ impl UploadHandler {
         // Build once, retry only the upload. `write_sst` takes
         // `&EncodedSsTable`, so the encoded SSTs stay alive for retries —
         // no need to rebuild from the memtable on transient upload errors.
+        let encode_started = Instant::now();
         let built = self.db.build_imm_ssts(job.imm_memtable.table()).await?;
+        let encode_ms = encode_started.elapsed().as_millis() as u64;
         let first_seq = job
             .imm_memtable
             .table()
@@ -197,15 +205,19 @@ impl UploadHandler {
         // uploads that already landed before the abort are left for the
         // garbage collector to reclaim, since the worker allocates ids
         // internally and they are not visible here for explicit cleanup.
+        let upload_started = Instant::now();
         let segments =
             futures::future::try_join_all(built.iter().map(|sst| self.upload_segment_sst(sst)))
                 .await?;
+        let upload_ms = upload_started.elapsed().as_millis() as u64;
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),
             segments,
             first_seq,
             last_seq,
+            encode_ms,
+            upload_ms,
         })
     }
 

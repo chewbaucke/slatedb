@@ -1815,6 +1815,8 @@ mod tests {
             segments,
             first_seq,
             last_seq,
+            encode_ms: 0,
+            upload_ms: 0,
         }
     }
 

@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use log::debug;
-use slatedb_common::metrics::{CounterFn, MetricsRecorderHelper};
+use log::{debug, info};
+use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
 
 use crate::checkpoint::CheckpointCreateResult;
 use crate::config::CheckpointOptions;
@@ -29,6 +29,7 @@ use crate::memtable_flusher::FlushTarget;
 use fail_parallel::fail_point;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
 macro_rules! memtable_flush_stat_name {
@@ -44,6 +45,10 @@ pub(crate) const FLUSH_REQUEST_COUNT: &str = memtable_flush_stat_name!("flush_re
 pub(crate) const L0_UPLOAD_COUNT: &str = memtable_flush_stat_name!("l0_upload_count");
 pub(crate) const L0_FLUSH_COUNT: &str = memtable_flush_stat_name!("l0_flush_count");
 pub(crate) const MANIFEST_REFRESH_COUNT: &str = memtable_flush_stat_name!("manifest_refresh_count");
+pub(crate) const LAST_L0_ENCODE_MS: &str = memtable_flush_stat_name!("last_l0_encode_ms");
+pub(crate) const LAST_L0_UPLOAD_MS: &str = memtable_flush_stat_name!("last_l0_upload_ms");
+pub(crate) const LAST_L0_FENCE_WAIT_MS: &str = memtable_flush_stat_name!("last_l0_fence_wait_ms");
+pub(crate) const LAST_L0_DISPATCH_DEPTH: &str = memtable_flush_stat_name!("last_l0_dispatch_depth");
 
 pub(crate) struct FlushTrackerStats {
     pub(crate) memtable_freeze_count: Arc<dyn CounterFn>,
@@ -52,6 +57,10 @@ pub(crate) struct FlushTrackerStats {
     pub(crate) l0_upload_count: Arc<dyn CounterFn>,
     pub(crate) l0_flush_count: Arc<dyn CounterFn>,
     pub(crate) manifest_refresh_count: Arc<dyn CounterFn>,
+    pub(crate) last_l0_encode_ms: Arc<dyn GaugeFn>,
+    pub(crate) last_l0_upload_ms: Arc<dyn GaugeFn>,
+    pub(crate) last_l0_fence_wait_ms: Arc<dyn GaugeFn>,
+    pub(crate) last_l0_dispatch_depth: Arc<dyn GaugeFn>,
 }
 
 impl FlushTrackerStats {
@@ -63,6 +72,10 @@ impl FlushTrackerStats {
             l0_upload_count: recorder.counter(L0_UPLOAD_COUNT).register(),
             l0_flush_count: recorder.counter(L0_FLUSH_COUNT).register(),
             manifest_refresh_count: recorder.counter(MANIFEST_REFRESH_COUNT).register(),
+            last_l0_encode_ms: recorder.gauge(LAST_L0_ENCODE_MS).register(),
+            last_l0_upload_ms: recorder.gauge(LAST_L0_UPLOAD_MS).register(),
+            last_l0_fence_wait_ms: recorder.gauge(LAST_L0_FENCE_WAIT_MS).register(),
+            last_l0_dispatch_depth: recorder.gauge(LAST_L0_DISPATCH_DEPTH).register(),
         }
     }
 }
@@ -168,6 +181,7 @@ impl MessageHandler<TrackerMessage> for FlushTracker {
             }
             TrackerMessage::FlushComplete { through_seq } => {
                 self.stats.l0_flush_count.increment(1);
+                self.record_flush_unit_timings(through_seq);
                 self.frontier.retire_through(through_seq);
                 self.reconcile_and_dispatch().await
             }
@@ -239,10 +253,47 @@ impl FlushTracker {
                 .map(|s| &s.sst_handle.id)
                 .collect::<Vec<_>>()
         );
-        self.frontier
-            .set_state(uploaded.last_seq, TrackedImmState::WritingManifest);
+        self.frontier.note_uploaded(
+            uploaded.last_seq,
+            uploaded.encode_ms,
+            uploaded.upload_ms,
+        );
         self.manifest_writer.notify_uploaded(uploaded).await?;
         Ok(())
+    }
+
+    /// Per-unit attribution: encode vs upload vs WAL fence-wait, plus how
+    /// many imms were in-flight when this unit became durable.
+    fn record_flush_unit_timings(&self, through_seq: u64) {
+        let dispatch_depth = self.frontier.reserved_l0_slots() as i64;
+        let pending_dispatch = self.frontier.pending_dispatch();
+        self.stats.last_l0_dispatch_depth.set(dispatch_depth);
+        for tracked in self
+            .frontier
+            .tracked
+            .iter()
+            .filter(|t| t.last_seq <= through_seq)
+        {
+            let encode_ms = tracked.encode_ms.unwrap_or(0);
+            let upload_ms = tracked.upload_ms.unwrap_or(0);
+            let fence_wait_ms = tracked
+                .uploaded_at
+                .map(|at| at.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            self.stats.last_l0_encode_ms.set(encode_ms as i64);
+            self.stats.last_l0_upload_ms.set(upload_ms as i64);
+            self.stats.last_l0_fence_wait_ms.set(fence_wait_ms as i64);
+            info!(
+                "l0 flush unit [first_seq={}, last_seq={}, encode_ms={}, upload_ms={}, fence_wait_ms={}, dispatch_depth={}, pending_dispatch={}]",
+                tracked.first_seq,
+                tracked.last_seq,
+                encode_ms,
+                upload_ms,
+                fence_wait_ms,
+                dispatch_depth,
+                pending_dispatch
+            );
+        }
     }
 
     /// Check for newly frozen immutable memtables and dispatch any that are ready.
@@ -388,6 +439,9 @@ struct TrackedImm {
     last_seq: u64,
     imm_memtable: Arc<crate::mem_table::ImmutableMemtable>,
     state: TrackedImmState,
+    encode_ms: Option<u64>,
+    upload_ms: Option<u64>,
+    uploaded_at: Option<Instant>,
 }
 
 /// Tracks the frontier of immutable memtables being flushed to L0.
@@ -426,6 +480,9 @@ impl TrackedImmFrontier {
                 last_seq,
                 imm_memtable,
                 state: TrackedImmState::PendingDispatch,
+                encode_ms: None,
+                upload_ms: None,
+                uploaded_at: None,
             });
         }
     }
@@ -496,6 +553,25 @@ impl TrackedImmFrontier {
             .find(|t| t.last_seq == last_seq)
             .expect("tracked imm not found for last_seq");
         tracked.state = state;
+    }
+
+    fn note_uploaded(&mut self, last_seq: u64, encode_ms: u64, upload_ms: u64) {
+        let tracked = self
+            .tracked
+            .iter_mut()
+            .find(|t| t.last_seq == last_seq)
+            .expect("tracked imm not found for last_seq");
+        tracked.state = TrackedImmState::WritingManifest;
+        tracked.encode_ms = Some(encode_ms);
+        tracked.upload_ms = Some(upload_ms);
+        tracked.uploaded_at = Some(Instant::now());
+    }
+
+    fn pending_dispatch(&self) -> usize {
+        self.tracked
+            .iter()
+            .filter(|t| matches!(t.state, TrackedImmState::PendingDispatch))
+            .count()
     }
 
     /// Remove tracked entries through the given sequence (inclusive).
@@ -1632,6 +1708,23 @@ mod tests {
                 frontier.tracked[0].state,
                 TrackedImmState::WritingManifest
             ));
+        }
+
+        #[test]
+        fn note_uploaded_records_encode_and_upload_ms() {
+            let mut frontier = TrackedImmFrontier::new();
+            frontier.register(std::iter::once(make_imm(1)));
+            frontier.prepare_next_upload();
+            frontier.note_uploaded(1, 12, 34);
+            assert!(matches!(
+                frontier.tracked[0].state,
+                TrackedImmState::WritingManifest
+            ));
+            assert_eq!(frontier.tracked[0].encode_ms, Some(12));
+            assert_eq!(frontier.tracked[0].upload_ms, Some(34));
+            assert!(frontier.tracked[0].uploaded_at.is_some());
+            assert_eq!(frontier.reserved_l0_slots(), 1);
+            assert_eq!(frontier.pending_dispatch(), 0);
         }
 
         #[test]
