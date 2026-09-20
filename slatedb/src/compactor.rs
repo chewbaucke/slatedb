@@ -524,6 +524,10 @@ pub(crate) struct CompactorEventHandler {
     /// Cached handles for per-worker `worker_last_heartbeat_ms` gauges. Handles are
     /// retained for every worker id observed by this coordinator process.
     worker_heartbeat_gauges: HashMap<String, Arc<dyn GaugeFn>>,
+    /// Executor-wall start (ms since epoch) stamped the first time this process
+    /// observes a job in `Running`. Not the compaction ULID datetime — that is
+    /// schedule-age and inflates `last_compaction_duration_ms` across suspend.
+    executor_started_ms: HashMap<Ulid, u64>,
 }
 
 #[async_trait]
@@ -553,6 +557,7 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
                 self.state_writer.load_compactions().await?;
                 self.update_distributed_compaction_metrics();
                 self.commit_compacted_entries().await?;
+                self.stamp_running_and_pending();
             }
         }
         Ok(())
@@ -598,6 +603,7 @@ impl CompactorEventHandler {
             recorder,
             prev_claimed: HashSet::new(),
             worker_heartbeat_gauges: HashMap::new(),
+            executor_started_ms: HashMap::new(),
         })
     }
 
@@ -611,6 +617,8 @@ impl CompactorEventHandler {
 
     /// Emits the current compaction state and per-job progress.
     fn handle_log_ticker(&self) {
+        let pending = self.state().active_compactions().count();
+        self.stats.pending_compaction_specs.set(pending as i64);
         self.log_compaction_state();
         self.log_compaction_throughput();
     }
@@ -634,13 +642,13 @@ impl CompactorEventHandler {
             total_estimated_bytes += estimated_source_bytes;
             total_bytes_processed += compaction.bytes_processed();
 
-            // Calculate elapsed time using ULID timestamp
-            let start_time_ms = compaction
-                .id()
-                .datetime()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("invalid duration")
-                .as_millis() as u64;
+            // Executor-wall when this process first saw Running; ULID datetime
+            // is schedule-age (cross-suspend debt), not execution.
+            let start_time_ms = self
+                .executor_started_ms
+                .get(&compaction.id())
+                .copied()
+                .unwrap_or(current_time_ms);
             let elapsed_secs = if start_time_ms > 0 {
                 (current_time_ms as f64 - start_time_ms as f64) / 1000.0
             } else {
@@ -719,6 +727,7 @@ impl CompactorEventHandler {
         self.commit_compacted_entries().await?;
         self.maybe_schedule_compactions().await?;
         self.maybe_validate_submitted_compactions().await?;
+        self.stamp_running_and_pending();
         Ok(())
     }
 
@@ -774,6 +783,7 @@ impl CompactorEventHandler {
                 c.set_status(CompactionStatus::Scheduled);
                 c.set_worker(None);
             });
+            self.executor_started_ms.remove(&id);
         }
 
         self.state_writer.write_compactions_safely().await?;
@@ -792,6 +802,8 @@ impl CompactorEventHandler {
     ///   coordinator process.
     fn update_distributed_compaction_metrics(&mut self) {
         use crate::compactor::stats::{WORKER_ID_LABEL, WORKER_LAST_HEARTBEAT_MS};
+
+        self.stamp_running_and_pending();
 
         let claimed: Vec<(Ulid, crate::compactor_state::WorkerSpec)> = self
             .state()
@@ -831,6 +843,22 @@ impl CompactorEventHandler {
                 });
             gauge.set(*last_heartbeat_ms as i64);
         }
+    }
+
+    /// First observation of `Running` this process is executor-wall start.
+    /// Pending specs = unfinished (Submitted+Scheduled+Running+Compacted).
+    fn stamp_running_and_pending(&mut self) {
+        let now_ms = self.system_clock.now().timestamp_millis() as u64;
+        let running: Vec<Ulid> = self
+            .state()
+            .compactions_with_status(&[CompactionStatus::Running])
+            .map(|c| c.id())
+            .collect();
+        for id in running {
+            self.executor_started_ms.entry(id).or_insert(now_ms);
+        }
+        let pending = self.state().active_compactions().count();
+        self.stats.pending_compaction_specs.set(pending as i64);
     }
 
     /// Commits any compactions in the `Compacted` state to the manifest.
@@ -1255,15 +1283,16 @@ impl CompactorEventHandler {
     }
 
     /// Last-unit duration/bytes for the sampler. Survives `slatedb=warn`.
-    fn record_compaction_finish(&self, compaction: &Compaction) {
+    /// Duration is executor-wall (`Running` first seen → Compacted commit),
+    /// not ULID creation → commit (that is schedule-age across suspend).
+    fn record_compaction_finish(&mut self, compaction: &Compaction) {
         let now = self.system_clock.now();
-        let start_ms = compaction
-            .id()
-            .datetime()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let duration_ms = (now.timestamp_millis() as u64).saturating_sub(start_ms);
+        let now_ms = now.timestamp_millis() as u64;
+        let start_ms = self
+            .executor_started_ms
+            .remove(&compaction.id())
+            .unwrap_or(now_ms);
+        let duration_ms = now_ms.saturating_sub(start_ms);
         let processed = compaction.bytes_processed();
         let output_bytes: u64 = compaction
             .output_ssts()
@@ -1321,14 +1350,18 @@ pub mod stats {
     pub const BYTES_COMPACTED: &str = compactor_stat_name!("bytes_compacted");
     pub const COMPACTOR_EPOCH: &str = compactor_stat_name!("epoch");
     pub const LAST_COMPACTION_TS_SEC: &str = compactor_stat_name!("last_compaction_timestamp_sec");
-    /// Wall time of the last finished job (ULID start → commit). Sampler-scraped;
-    /// `info!` completion logs are hidden when `RUST_LOG` sets `slatedb=warn`.
+    /// Wall time of the last finished job (executor `Running` → Compacted commit).
+    /// Sampler-scraped; `info!` completion logs are hidden when `RUST_LOG` sets
+    /// `slatedb=warn`. Not ULID datetime — that is schedule-age.
     pub const LAST_COMPACTION_DURATION_MS: &str =
         compactor_stat_name!("last_compaction_duration_ms");
     /// Bytes of the last finished job (`bytes_processed`, else output SST sizes).
     pub const LAST_COMPACTION_BYTES: &str = compactor_stat_name!("last_compaction_bytes");
     pub const COMPACTIONS_FINISHED: &str = compactor_stat_name!("compactions_finished");
     pub const RUNNING_COMPACTIONS: &str = compactor_stat_name!("running_compactions");
+    /// Unfinished specs (Submitted+Scheduled+Running+Compacted). Close drain
+    /// waits until this is 0 and `running_compactions` is 0.
+    pub const PENDING_COMPACTION_SPECS: &str = compactor_stat_name!("pending_compaction_specs");
     pub const SSTS_WRITTEN: &str = compactor_stat_name!("ssts_written");
     pub const JOBS_CLAIMED: &str = compactor_stat_name!("jobs_claimed");
     pub const JOBS_RECLAIMED: &str = compactor_stat_name!("jobs_reclaimed");
@@ -1362,6 +1395,7 @@ pub mod stats {
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
         pub(crate) last_compaction_duration_ms: Arc<dyn GaugeFn>,
         pub(crate) last_compaction_bytes: Arc<dyn GaugeFn>,
+        pub(crate) pending_compaction_specs: Arc<dyn GaugeFn>,
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
         pub(crate) merge_operator_compact_operands: Arc<dyn CounterFn>,
@@ -1385,6 +1419,7 @@ pub mod stats {
                     .gauge(LAST_COMPACTION_DURATION_MS)
                     .register(),
                 last_compaction_bytes: recorder.gauge(LAST_COMPACTION_BYTES).register(),
+                pending_compaction_specs: recorder.gauge(PENDING_COMPACTION_SPECS).register(),
                 jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
                 jobs_reclaimed: recorder.counter(JOBS_RECLAIMED).register(),
                 source_missing: recorder.counter(SOURCE_MISSING).register(),
@@ -4857,6 +4892,68 @@ mod tests {
         assert!(
             bytes >= 0,
             "last_compaction_bytes should be present, got {bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_last_compaction_duration_is_executor_wall_not_ulid() {
+        use crate::compactor::stats::{LAST_COMPACTION_DURATION_MS, PENDING_COMPACTION_SPECS};
+
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        // ULID timestamp ~1s after epoch — years of schedule-age if used as start.
+        let old_id = Ulid::from_parts(1_000, 0);
+        let compaction =
+            Compaction::new(old_id, CompactionSpec::new(vec![], 0)).with_status(CompactionStatus::Compacted);
+        fixture.handler.record_compaction_finish(&compaction);
+        let duration_ms = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            LAST_COMPACTION_DURATION_MS,
+        )
+        .expect("duration gauge missing");
+        assert!(
+            duration_ms < 60_000,
+            "duration must be executor-wall (missing stamp → 0), not ULID age; got {duration_ms}"
+        );
+
+        let started = fixture.handler.system_clock.now().timestamp_millis() as u64 - 1_720;
+        fixture.handler.executor_started_ms.insert(old_id, started);
+        fixture.handler.record_compaction_finish(&compaction);
+        let stamped = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            LAST_COMPACTION_DURATION_MS,
+        )
+        .expect("duration gauge missing");
+        assert!(
+            (1_000..10_000).contains(&stamped),
+            "stamped executor-wall duration expected ~1720ms, got {stamped}"
+        );
+
+        fixture.handler.stamp_running_and_pending();
+        let pending = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            PENDING_COMPACTION_SPECS,
+        )
+        .expect("pending gauge missing");
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pending_compaction_specs_tracks_unfinished() {
+        use crate::compactor::stats::PENDING_COMPACTION_SPECS;
+
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.write_l0().await;
+        let compaction = fixture.build_l0_compaction().await;
+        fixture.scheduler.inject_compaction(compaction);
+        fixture.handler.handle_ticker().await.unwrap();
+        let pending = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            PENDING_COMPACTION_SPECS,
+        )
+        .expect("pending gauge missing");
+        assert!(
+            pending >= 1,
+            "scheduled job should count as pending specs, got {pending}"
         );
     }
 
