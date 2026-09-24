@@ -88,6 +88,24 @@ impl FoyerCache {
             .build();
         Self { inner: cache }
     }
+
+    /// Same cache as [`Self::new_with_opts`], with a stable name and a shared
+    /// metrics registry. Block and meta caches must use different names so
+    /// hit/miss counters do not collapse. `new_with_opts` stays unmetered
+    /// because this crate has no metrics recorder of its own.
+    pub fn new_metered(
+        options: FoyerCacheOptions,
+        name: impl Into<String>,
+        registry: mixtrics::metrics::BoxedRegistry,
+    ) -> Self {
+        let cache = foyer::CacheBuilder::new(options.max_capacity as _)
+            .with_name(name.into())
+            .with_metrics_registry(registry)
+            .with_weighter(|_, v: &CachedEntry| v.size())
+            .with_shards(options.shards)
+            .build();
+        Self { inner: cache }
+    }
 }
 
 impl Default for FoyerCache {
