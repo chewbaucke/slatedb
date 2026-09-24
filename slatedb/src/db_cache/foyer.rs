@@ -34,8 +34,41 @@
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, DEFAULT_MAX_CAPACITY};
 use crate::error::SlateDBError;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use sysinfo::{CpuRefreshKind, System};
+
+/// Live caches only. Foyer's `foyer_memory_usage` gauge is not decremented
+/// when a cache is cleared on drop, so a process that opens a lane, closes
+/// it, and opens the next one reports a sum that walks past the cap.
+struct LiveCache {
+    name: String,
+    usage: Weak<dyn Fn() -> u64 + Send + Sync>,
+}
+
+static LIVE_CACHES: Mutex<Vec<LiveCache>> = Mutex::new(Vec::new());
+
+fn live_caches() -> std::sync::MutexGuard<'static, Vec<LiveCache>> {
+    LIVE_CACHES.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Sum of `usage()` over caches still alive under `name`. Dropped caches
+/// contribute nothing.
+pub fn live_occupancy(name: &str) -> u64 {
+    let mut live = live_caches();
+    live.retain(|slot| slot.usage.strong_count() > 0);
+    live.iter()
+        .filter(|slot| slot.name == name)
+        .filter_map(|slot| slot.usage.upgrade())
+        .map(|usage| usage())
+        .sum()
+}
+
+fn register_live(name: String, usage: &Arc<dyn Fn() -> u64 + Send + Sync>) {
+    live_caches().push(LiveCache {
+        name,
+        usage: Arc::downgrade(usage),
+    });
+}
 
 /// The options for the Foyer cache.
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +107,8 @@ impl Default for FoyerCacheOptions {
 /// It uses a custom weigher to account for the size of cached blocks.
 pub struct FoyerCache {
     inner: foyer::Cache<CachedKey, CachedEntry>,
+    /// Keeps this cache in [`live_occupancy`] until drop.
+    _occupancy: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl FoyerCache {
@@ -86,25 +121,46 @@ impl FoyerCache {
             .with_weighter(|_, v: &CachedEntry| v.size())
             .with_shards(options.shards)
             .build();
-        Self { inner: cache }
+        Self {
+            inner: cache,
+            _occupancy: None,
+        }
     }
 
     /// Same cache as [`Self::new_with_opts`], with a stable name and a shared
     /// metrics registry. Block and meta caches must use different names so
     /// hit/miss counters do not collapse. `new_with_opts` stays unmetered
     /// because this crate has no metrics recorder of its own.
+    ///
+    /// Also registers the cache for [`live_occupancy`]. That reading is the
+    /// current weight of caches that are still open, which the usage gauge
+    /// is not: foyer leaves the gauge behind when a cache is dropped.
     pub fn new_metered(
         options: FoyerCacheOptions,
         name: impl Into<String>,
         registry: mixtrics::metrics::BoxedRegistry,
     ) -> Self {
+        let name = name.into();
         let cache = foyer::CacheBuilder::new(options.max_capacity as _)
-            .with_name(name.into())
+            .with_name(name.clone())
             .with_metrics_registry(registry)
             .with_weighter(|_, v: &CachedEntry| v.size())
             .with_shards(options.shards)
             .build();
-        Self { inner: cache }
+        let occupancy: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new({
+            let cache = cache.clone();
+            move || cache.usage() as u64
+        });
+        register_live(name, &occupancy);
+        Self {
+            inner: cache,
+            _occupancy: Some(occupancy),
+        }
+    }
+
+    /// Current weighted occupancy of this cache. At most `max_capacity`.
+    pub fn usage(&self) -> u64 {
+        self.inner.usage() as u64
     }
 }
 
@@ -198,5 +254,28 @@ impl FoyerCache {
             Ok(entry) => Ok(entry.value().clone()),
             Err(err) => Err(SlateDBError::FoyerError(Arc::new(err)).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noop_registry() -> mixtrics::metrics::BoxedRegistry {
+        Box::new(mixtrics::registry::noop::NoopMetricsRegistry)
+    }
+
+    #[test]
+    fn live_occupancy_drops_when_the_cache_drops() {
+        let name = format!("live-occ-{}", std::process::id());
+        let opts = FoyerCacheOptions {
+            max_capacity: 4096,
+            shards: 1,
+        };
+        {
+            let cache = FoyerCache::new_metered(opts, name.clone(), noop_registry());
+            assert_eq!(live_occupancy(&name), cache.usage());
+        }
+        assert_eq!(live_occupancy(&name), 0);
     }
 }
