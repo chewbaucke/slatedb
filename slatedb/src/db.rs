@@ -10885,4 +10885,59 @@ mod tests {
         let value_b_cached = reader_b.get(b"key1").await.unwrap();
         assert_eq!(value_b_cached, Some(Bytes::from("value_from_db_b")));
     }
+
+    #[tokio::test]
+    async fn test_db_reader_shared_cache_survives_reopen() {
+        use crate::db_cache::test_utils::TestCache;
+        use crate::db_cache::DbCache;
+
+        // A database with one flushed SST
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_reader_cache_reopen";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key1", b"value1").await.unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+
+        let shared_cache = Arc::new(TestCache::new());
+
+        // First reader open populates the shared cache
+        let reader1 = DbReaderBuilder::new(path, object_store.clone())
+            .with_db_cache(shared_cache.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader1.get(b"key1").await.unwrap(),
+            Some(Bytes::from("value1"))
+        );
+        let entries_after_first_open = shared_cache.entry_count();
+        assert!(
+            entries_after_first_open > 0,
+            "first open must populate the cache"
+        );
+        reader1.close().await.unwrap();
+
+        // Second reader open at the same path must address the same entries:
+        // a hit inserts nothing, so the entry count must not grow.
+        let reader2 = DbReaderBuilder::new(path, object_store.clone())
+            .with_db_cache(shared_cache.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader2.get(b"key1").await.unwrap(),
+            Some(Bytes::from("value1"))
+        );
+        assert_eq!(
+            shared_cache.entry_count(),
+            entries_after_first_open,
+            "reopened reader re-fetched entries the first open had cached"
+        );
+        reader2.close().await.unwrap();
+    }
 }

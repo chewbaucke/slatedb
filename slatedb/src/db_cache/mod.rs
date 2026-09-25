@@ -599,16 +599,58 @@ pub(crate) struct DbCacheWrapper {
     last_err_log_time: Mutex<Option<DateTime<Utc>>>,
 }
 
+/// Derives a stable cache scope from a Db path (SipHash-1-3, zero keys).
+///
+/// Upstream scoping (#1087) isolates databases that share one cache, but its
+/// process-local counter makes every reopen a new namespace, which defeats
+/// disk-backed caches: entries written by one open are unreachable by the next.
+/// Deriving the scope from the path keeps distinct databases isolated while
+/// giving one database a stable namespace across reopens, restarts, and
+/// suspend/resume with a persistent volume. Same-path sharing is sound because
+/// SSTs are immutable objects: (path, sst id, block id) identifies content.
+///
+/// Caveat: a path reused by a *recreated* database inherits the old database's
+/// scope; a fresh store must start with an empty cache directory. Scope 0 is
+/// reserved for legacy pre-scoping (V1) keys; a zero hash is remapped.
+pub(crate) fn stable_scope_id(path: &str) -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    path.hash(&mut hasher);
+    match hasher.finish() {
+        0 => u64::MAX,
+        scope => scope,
+    }
+}
+
 impl DbCacheWrapper {
     pub(crate) fn new(
         cache: Arc<dyn DbCache>,
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
     ) -> Self {
+        Self::new_with_scope(
+            cache,
+            recorder,
+            system_clock,
+            NEXT_CACHE_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    /// Creates a wrapper with an explicit scope id. Production builders derive the
+    /// scope from the Db path ([`stable_scope_id`]) so entries written by one open
+    /// remain addressable by the next; `new` retains the process-unique counter for
+    /// tests and direct construction.
+    pub(crate) fn new_with_scope(
+        cache: Arc<dyn DbCache>,
+        recorder: &MetricsRecorderHelper,
+        system_clock: Arc<dyn SystemClock>,
+        scope_id: u64,
+    ) -> Self {
         Self {
             stats: DbCacheStats::new(recorder),
             cache,
-            scope_id: NEXT_CACHE_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+            scope_id,
             last_err_log_time: Mutex::new(None),
             system_clock,
         }

@@ -138,7 +138,7 @@ use crate::config::{Settings, SstBlockSize};
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
-use crate::db_cache::{DbCache, DbCacheWrapper};
+use crate::db_cache::{stable_scope_id, DbCache, DbCacheWrapper};
 use crate::db_reader::DbReader;
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 use crate::dispatcher::MessageHandlerExecutor;
@@ -538,10 +538,13 @@ impl<P: Into<Path>> DbBuilder<P> {
             path_resolver.clone(),
             self.fp_registry.clone(),
             self.db_cache.as_ref().map(|c| {
-                Arc::new(DbCacheWrapper::new(
+                let scope_id = stable_scope_id(path.as_ref());
+                info!("derived db cache scope [path={}, scope_id={}]", path, scope_id);
+                Arc::new(DbCacheWrapper::new_with_scope(
                     c.clone(),
                     &recorder,
                     system_clock.clone(),
+                    scope_id,
                 )) as Arc<dyn DbCache>
             }),
             TableStoreKind::Main,
@@ -1732,10 +1735,13 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         }
 
         let wrapped_cache = self.db_cache.as_ref().map(|c| {
-            Arc::new(DbCacheWrapper::new(
+            let scope_id = stable_scope_id(path.as_ref());
+            info!("derived db cache scope [path={}, scope_id={}]", path, scope_id);
+            Arc::new(DbCacheWrapper::new_with_scope(
                 c.clone(),
                 &recorder,
                 self.system_clock.clone(),
+                scope_id,
             )) as Arc<dyn DbCache>
         });
 
