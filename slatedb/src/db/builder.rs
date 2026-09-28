@@ -133,7 +133,7 @@ use crate::compactor::COMPACTOR_TASK_NAME;
 use crate::compactor::{CompactionSchedulerSupplier, Compactor};
 use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
-use crate::config::{CompactionWorkerOptions, CompactorOptions};
+use crate::config::{CompactionWorkerOptions, CompactorOptions, ObjectStoreCacheOptions};
 use crate::config::{Settings, SstBlockSize};
 use crate::db::Db;
 use crate::db::DbInner;
@@ -1051,6 +1051,10 @@ pub struct CompactorBuilder<P: Into<Path>> {
     fp_registry: Arc<FailPointRegistry>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    /// Standalone compaction reads and writes SSTs through this cache.
+    /// Manifest and compaction-table stores stay on the uncached store.
+    /// `None` root leaves the table store uncached.
+    object_store_cache_options: ObjectStoreCacheOptions,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1072,6 +1076,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             fp_registry: Arc::new(FailPointRegistry::new()),
             block_transformer: None,
             filter_policies: default_filter_policies(),
+            object_store_cache_options: ObjectStoreCacheOptions::default(),
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1092,6 +1097,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             fp_registry: self.fp_registry,
             block_transformer: self.block_transformer,
             filter_policies: self.filter_policies,
+            object_store_cache_options: self.object_store_cache_options,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
         }
@@ -1108,6 +1114,18 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     pub fn with_options(mut self, options: CompactorOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Caches compaction SST reads and, when `cache_puts` is set, compaction
+    /// output. The manifest store is not wrapped.
+    pub fn with_object_store_cache_options(mut self, options: ObjectStoreCacheOptions) -> Self {
+        self.object_store_cache_options = options;
+        self
+    }
+
+    /// The cache options this builder will install. Empty `root_folder` means off.
+    pub fn object_store_cache_options(&self) -> &ObjectStoreCacheOptions {
+        &self.object_store_cache_options
     }
 
     /// Sets a user-provided metrics recorder for the compactor.
@@ -1194,7 +1212,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     }
 
     /// Builds and returns a Compactor instance.
-    pub fn build(self) -> Compactor {
+    ///
+    /// SST I/O goes through [`CachedObjectStore`] when
+    /// [`ObjectStoreCacheOptions::root_folder`] is set. Manifest and
+    /// compaction-table I/O stay on the retrying store.
+    pub async fn build(self) -> Result<Compactor, crate::Error> {
         let path: Path = self.path.into();
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
@@ -1208,6 +1230,18 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.rand.clone(),
             self.system_clock.clone(),
         );
+        let cached_object_store = CachedObjectStore::from_config(
+            retrying_main_object_store.clone(),
+            &self.object_store_cache_options,
+            &recorder,
+            self.system_clock.clone(),
+            self.rand.clone(),
+        )
+        .await?;
+        let table_object_store: Arc<dyn ObjectStore> = match &cached_object_store {
+            Some(cached_store) => cached_store.clone(),
+            None => retrying_main_object_store.clone(),
+        };
         let manifest_store = Arc::new(ManifestStore::new(
             &path,
             retrying_main_object_store.clone(),
@@ -1222,7 +1256,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(retrying_main_object_store, None),
+            ObjectStores::new(table_object_store, None),
             sst_format,
             path,
             None,
@@ -1233,7 +1267,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             .scheduler_supplier
             .unwrap_or(Arc::new(SizeTieredCompactionSchedulerSupplier));
 
-        Compactor::new(
+        Ok(Compactor::new(
             manifest_store,
             compactions_store,
             table_store,
@@ -1248,7 +1282,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.merge_operator,
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
-        )
+        ))
     }
 
     /// Build a CompactorEventHandler and optionally an embedded worker from this builder's
@@ -2227,7 +2261,9 @@ mod tests {
             .build();
         let _compactor = crate::CompactorBuilder::new(path, object_store)
             .with_metrics_recorder(metrics_recorder.clone())
-            .build();
+            .build()
+            .await
+            .expect("failed to build compactor");
 
         // when:
         db.put(b"k1", b"v1")

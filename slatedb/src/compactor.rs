@@ -1562,8 +1562,8 @@ mod tests {
     use crate::compactor_state::CompactionStatus;
     use crate::compactor_state::{SourceId, WorkerSpec};
     use crate::config::{
-        CompactionWorkerOptions, FlushOptions, FlushType, MergeOptions, PutOptions, Settings,
-        SizeTieredCompactionSchedulerOptions, Ttl, WriteOptions,
+        CompactionWorkerOptions, FlushOptions, FlushType, MergeOptions, ObjectStoreCacheOptions,
+        PutOptions, Settings, SizeTieredCompactionSchedulerOptions, Ttl, WriteOptions,
     };
     use crate::db::Db;
     use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
@@ -6007,6 +6007,88 @@ mod tests {
             .validate_compaction(&Compaction::new(Ulid::new(), spec))
             .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_compactor_caches_sst_io_and_not_the_manifest() {
+        let os = Arc::new(InMemory::new());
+        let path = "/tmp/test_standalone_compactor_caches_sst_io";
+        let cache = std::env::temp_dir().join(format!(
+            "standalone-compactor-osc-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+
+        let mut options = db_options(None);
+        options.l0_sst_size_bytes = 128;
+        options.flush_interval = None;
+        let db = Db::builder(path, os.clone())
+            .with_settings(options)
+            .build()
+            .await
+            .unwrap();
+        for i in 0..8 {
+            let key = format!("k{i:04}");
+            put_and_flush_memtable(&db, key.as_bytes(), b"v").await;
+        }
+        db.close().await.unwrap();
+
+        let mut cache_opts = ObjectStoreCacheOptions::default();
+        cache_opts.root_folder = Some(cache.clone());
+        cache_opts.cache_puts = true;
+        cache_opts.part_size_bytes = 1024;
+        let compactor = Arc::new(
+            CompactorBuilder::new(path, os)
+                .with_options(compactor_options())
+                .with_object_store_cache_options(cache_opts)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let runner = {
+            let compactor = Arc::clone(&compactor);
+            tokio::spawn(async move { compactor.run().await })
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut paths = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            paths = cache_file_paths(&cache);
+            if paths.iter().any(|path| path.contains(".sst")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        compactor.stop().await.unwrap();
+        let _ = runner.await;
+
+        assert!(
+            paths.iter().any(|path| path.contains(".sst")),
+            "compaction SST I/O did not enter the cache: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| !path.contains("manifest")),
+            "manifest I/O entered the compactor cache: {paths:?}"
+        );
+    }
+
+    fn cache_file_paths(root: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path.display().to_string());
+                }
+            }
+        }
+        walk(root, &mut out);
+        out
     }
 
     async fn put_and_flush_memtable(db: &Db, key: &[u8], value: &[u8]) {

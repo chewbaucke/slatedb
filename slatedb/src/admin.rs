@@ -385,7 +385,7 @@ impl Admin {
             builder = builder.with_merge_operator(merge_operator.clone());
         }
 
-        let compactor = builder.build();
+        let compactor = builder.build().await?;
 
         compactor.start().await?;
 
