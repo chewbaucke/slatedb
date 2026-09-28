@@ -637,8 +637,14 @@ impl CompactorEventHandler {
             .active_compactions()
             .filter(|c| c.status() != CompactionStatus::Compacted)
         {
-            let estimated_source_bytes =
+            let (estimated_source_bytes, source_missing) =
                 Self::calculate_estimated_source_bytes(compaction, db_state);
+            if source_missing {
+                // Same signal as `validate_compaction`: a concurrent commit
+                // removed a source this job still names. Reporting must not
+                // panic; validation is what fails the job.
+                self.stats.source_missing.increment(1);
+            }
             total_estimated_bytes += estimated_source_bytes;
             total_bytes_processed += compaction.bytes_processed();
 
@@ -691,32 +697,55 @@ impl CompactorEventHandler {
         self.stats.total_throughput.set(total_throughput as i64);
     }
 
-    /// Calculates the estimated total source bytes for a compaction.
-    fn calculate_estimated_source_bytes(compaction: &Compaction, db_state: &ManifestCore) -> u64 {
-        let tree = db_state
-            .tree_for_segment(compaction.spec().segment())
-            .expect("compaction target segment missing from manifest");
+    /// Estimated source bytes for progress reporting.
+    ///
+    /// A missing segment or source is skipped. The bool is true when any
+    /// source was absent. Callers increment `source_missing` and keep going.
+    /// `commit_compacted_entries` does not use this function: a Compacted job
+    /// whose sources are gone fails in `validate_compaction` and is marked
+    /// `Failed`, so this ticker fix does not move the panic onto the commit path.
+    fn calculate_estimated_source_bytes(
+        compaction: &Compaction,
+        db_state: &ManifestCore,
+    ) -> (u64, bool) {
+        let Some(tree) = db_state.tree_for_segment(compaction.spec().segment()) else {
+            warn!(
+                "compaction target segment missing from manifest [id={}]",
+                compaction.id()
+            );
+            return (0, true);
+        };
 
         let views_by_id: HashMap<Ulid, &SsTableView> =
             tree.l0.iter().map(|view| (view.id, view)).collect();
         let srs_by_id: HashMap<u32, &SortedRun> =
             tree.compacted.iter().map(|sr| (sr.id, sr)).collect();
 
-        compaction
+        let mut missing = false;
+        let bytes = compaction
             .spec()
             .sources()
             .iter()
             .map(|source| match source {
-                SourceId::SstView(id) => views_by_id
-                    .get(id)
-                    .expect("compaction source view not found in L0")
-                    .estimate_size(),
-                SourceId::SortedRun(id) => srs_by_id
-                    .get(id)
-                    .expect("compaction source sorted run not found")
-                    .estimate_size(),
+                SourceId::SstView(id) => match views_by_id.get(id) {
+                    Some(view) => view.estimate_size(),
+                    None => {
+                        missing = true;
+                        warn!("compaction source view not found in L0 [id={id:?}]");
+                        0
+                    }
+                },
+                SourceId::SortedRun(id) => match srs_by_id.get(id) {
+                    Some(run) => run.estimate_size(),
+                    None => {
+                        missing = true;
+                        warn!("compaction source sorted run not found [id={id}]");
+                        0
+                    }
+                },
             })
-            .sum()
+            .sum();
+        (bytes, missing)
     }
 
     /// Handles a polling tick by refreshing compactions and the manifest, then possibly scheduling compactions.
@@ -1299,7 +1328,11 @@ impl CompactorEventHandler {
             .iter()
             .map(|sst| sst.info.filter_offset as u64)
             .sum();
-        let bytes = if processed > 0 { processed } else { output_bytes };
+        let bytes = if processed > 0 {
+            processed
+        } else {
+            output_bytes
+        };
         self.stats
             .record_finished(duration_ms, bytes, now.timestamp());
         info!(
@@ -1415,9 +1448,7 @@ pub mod stats {
             Self {
                 compactor_epoch: recorder.gauge(COMPACTOR_EPOCH).register(),
                 last_compaction_ts: recorder.gauge(LAST_COMPACTION_TS_SEC).register(),
-                last_compaction_duration_ms: recorder
-                    .gauge(LAST_COMPACTION_DURATION_MS)
-                    .register(),
+                last_compaction_duration_ms: recorder.gauge(LAST_COMPACTION_DURATION_MS).register(),
                 last_compaction_bytes: recorder.gauge(LAST_COMPACTION_BYTES).register(),
                 pending_compaction_specs: recorder.gauge(PENDING_COMPACTION_SPECS).register(),
                 jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
@@ -1444,12 +1475,7 @@ pub mod stats {
             }
         }
 
-        pub(crate) fn record_finished(
-            &self,
-            duration_ms: u64,
-            bytes: u64,
-            now_ts_sec: i64,
-        ) {
+        pub(crate) fn record_finished(&self, duration_ms: u64, bytes: u64, now_ts_sec: i64) {
             self.last_compaction_duration_ms.set(duration_ms as i64);
             self.last_compaction_bytes.set(bytes as i64);
             self.last_compaction_ts.set(now_ts_sec);
@@ -3832,8 +3858,37 @@ mod tests {
         );
 
         let expected = segment_l0.estimate_size() + segment_sr.estimate_size();
-        let actual = CompactorEventHandler::calculate_estimated_source_bytes(&compaction, &core);
+        let (actual, missing) =
+            CompactorEventHandler::calculate_estimated_source_bytes(&compaction, &core);
+        assert!(!missing);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn missing_compaction_source_is_skipped_instead_of_panicking() {
+        let core = ManifestCore::new();
+        let ghost = Ulid::from_parts(u64::MAX, 0);
+        let compaction = Compaction::new(
+            Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SstView(ghost), SourceId::SortedRun(7)], 1),
+        );
+        let (bytes, missing) =
+            CompactorEventHandler::calculate_estimated_source_bytes(&compaction, &core);
+        assert!(missing);
+        assert_eq!(bytes, 0);
+
+        let compaction = Compaction::new(
+            Ulid::new(),
+            CompactionSpec::for_segment(
+                Bytes::from_static(b"gone"),
+                vec![SourceId::SortedRun(1)],
+                1,
+            ),
+        );
+        let (bytes, missing) =
+            CompactorEventHandler::calculate_estimated_source_bytes(&compaction, &core);
+        assert!(missing);
+        assert_eq!(bytes, 0);
     }
 
     #[tokio::test]
@@ -4902,8 +4957,8 @@ mod tests {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         // ULID timestamp ~1s after epoch — years of schedule-age if used as start.
         let old_id = Ulid::from_parts(1_000, 0);
-        let compaction =
-            Compaction::new(old_id, CompactionSpec::new(vec![], 0)).with_status(CompactionStatus::Compacted);
+        let compaction = Compaction::new(old_id, CompactionSpec::new(vec![], 0))
+            .with_status(CompactionStatus::Compacted);
         fixture.handler.record_compaction_finish(&compaction);
         let duration_ms = slatedb_common::metrics::lookup_metric(
             &fixture.test_recorder,
